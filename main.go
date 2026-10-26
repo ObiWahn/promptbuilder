@@ -23,11 +23,11 @@ func esc(sgr string) string {
 var reset = esc(sgrReset)
 
 func userColor(username string, uid int) string {
-	if uid == 0 {
-		return sgrRed // unconditional, matches the original's unconditional root check
-	}
 	if sgr, ok := configuredColor("user", username); ok {
 		return sgr
+	}
+	if uid == 0 {
+		return sgrRed // root, no config match: red fallback instead of green
 	}
 	// No config file and no match - matches all/prompt's true baseline
 	// ("_user_color=$_green") from before host/prompt_colors gets sourced
@@ -36,9 +36,12 @@ func userColor(username string, uid int) string {
 	return sgrGreen
 }
 
-func hostColor(hostname string) string {
+func hostColor(hostname string, uid int) string {
 	if sgr, ok := configuredColor("host", hostname); ok {
 		return sgr
+	}
+	if uid == 0 {
+		return sgrRed // root, no config match: red fallback instead of green
 	}
 	// Same reasoning as userColor: all/prompt's true baseline
 	// ("_host_color=$_green") before host/prompt_colors overrides it.
@@ -49,13 +52,14 @@ func hostColor(hostname string) string {
 // Fields are exported so this survives the daemon's JSON round-trip
 // (encoding/json silently drops unexported fields).
 type gitInfo struct {
-	Branch   string
-	Detached bool
-	Staged   bool // index differs from HEAD (green "+" in the original)
-	Unstaged bool // worktree differs from index, or untracked files (red "*")
-	Ahead    int
-	Behind   int
-	HasUp    bool // has an upstream configured, i.e. ahead/behind are meaningful
+	Branch    string
+	Detached  bool
+	Staged    bool // index differs from HEAD (green "+" in the original)
+	Unstaged  bool // tracked worktree differs from index, or unmerged/conflict (red "*")
+	Untracked bool // untracked files present (green "*" unless Unstaged is also true)
+	Ahead     int
+	Behind    int
+	HasUp     bool // has an upstream configured, i.e. ahead/behind are meaningful
 }
 
 // gitResult is the three-state answer buildPrompt actually needs: not a
@@ -160,7 +164,7 @@ func runGitStatus(dir string) (gitInfo, bool, string) {
 		case line == "" || strings.HasPrefix(line, "#"):
 			// ignore (blank line, or other header lines like branch.upstream)
 		case strings.HasPrefix(line, "? "):
-			gi.Unstaged = true // untracked file
+			gi.Untracked = true // untracked file
 		case strings.HasPrefix(line, "u "):
 			gi.Unstaged = true // unmerged/conflict - surfaced as dirty for now
 		case strings.HasPrefix(line, "1 ") || strings.HasPrefix(line, "2 "):
@@ -220,7 +224,7 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 	sb.WriteString(esc(userColor(username, uid)))
 	sb.WriteString(username + "@")
 	sb.WriteString(reset)
-	sb.WriteString(esc(hostColor(hostname)))
+	sb.WriteString(esc(hostColor(hostname, uid)))
 	sb.WriteString(hostname)
 	sb.WriteString(reset)
 	sb.WriteString(esc(userColor(username, uid)))
@@ -262,7 +266,7 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 		// The original inserts exactly one space before the flags block as a
 		// whole (only if there's anything to show), never between the
 		// individual flags themselves - i.e. "master *>", not "master * >".
-		if gi.Staged || gi.Unstaged || gi.HasUp {
+		if gi.Staged || gi.Unstaged || gi.Untracked || gi.HasUp {
 			sb.WriteString(" ")
 		}
 		if gi.Staged {
@@ -271,7 +275,11 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 			sb.WriteString(reset)
 		}
 		if gi.Unstaged {
-			sb.WriteString(esc(sgrRed)) // "*", same as original's bad_color
+			sb.WriteString(esc(sgrRed)) // "*", real tracked changes or a conflict
+			sb.WriteString("*")
+			sb.WriteString(reset)
+		} else if gi.Untracked {
+			sb.WriteString(esc(sgrGreen)) // "*", untracked files only - nothing tracked is dirty
 			sb.WriteString("*")
 			sb.WriteString(reset)
 		}
@@ -522,7 +530,7 @@ func main() {
 			exitLabel = sgrBoldRed + " (red)"
 		}
 		fmt.Printf("this run: user color=%s host color=%s exit color=%s\n",
-			userColor(os.Getenv("USER"), os.Getuid()), hostColor(mustHostname()), exitLabel)
+			userColor(os.Getenv("USER"), os.Getuid()), hostColor(mustHostname(), os.Getuid()), exitLabel)
 	default:
 		if isTerminalStdout() {
 			fmt.Print(stripMarkers(out))
