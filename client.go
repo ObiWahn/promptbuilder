@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -73,6 +74,45 @@ func tryDaemon(cwd string) (gr gitResult, reached bool) {
 		return pendingGitResult(cwd), true
 	}
 	return gitResult{IsRepo: resp.IsRepo, OK: resp.OK, Pending: resp.Pending, Info: resp.Info, Error: resp.Error}, true
+}
+
+// refreshDaemon is `promptbuilder --refresh`: it makes the daemon rescan
+// the current repo and returns once that's done, so the next prompt is
+// fresh. Without a daemon there's nothing to do - the next prompt runs git
+// directly anyway.
+func refreshDaemon() error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	path := socketPath()
+	if path == "" {
+		return nil
+	}
+	conn, err := net.DialTimeout("unix", path, daemonDialTimeout)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	if !peerIsTrusted(conn) {
+		return errors.New("daemon socket is not served by this user")
+	}
+	conn.SetDeadline(time.Now().Add(refreshBudget() + 2*time.Second))
+
+	if _, err := conn.Write([]byte(refreshPrefix + cwd + "\n")); err != nil {
+		return err
+	}
+	var resp daemonResponse
+	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		return err
+	}
+	switch {
+	case !resp.IsRepo:
+		return errors.New("not a git repository")
+	case resp.Error != "":
+		return errors.New(resp.Error)
+	}
+	return nil
 }
 
 func pendingGitResult(cwd string) gitResult {

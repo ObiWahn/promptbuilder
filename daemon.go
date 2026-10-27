@@ -46,6 +46,11 @@ const (
 
 // daemonResponse is what the daemon sends back for one request - the wire
 // form of gitResult (main.go), which is what buildPrompt actually needs.
+// refreshPrefix marks a request from `promptbuilder --refresh`: rescan now
+// and answer once that scan is done. A plain request line is the cwd,
+// which is always absolute, so it can never start with this.
+const refreshPrefix = "refresh "
+
 type daemonResponse struct {
 	IsRepo  bool    `json:"isRepo"`
 	OK      bool    `json:"ok"`
@@ -345,6 +350,28 @@ func recentDirs(root string) []string {
 	return dirs
 }
 
+// refreshBudget is how long a --refresh request may wait: the scan that
+// may already be running, then the one it asked for.
+func refreshBudget() time.Duration {
+	return 2 * gitTimeout()
+}
+
+// forceRefresh runs a scan that starts after this call - if one is already
+// running it may have missed the change, so it goes around once more - and
+// waits for it, bounded by refreshBudget. Reports an error message, or "" once the cache is fresh.
+func (rs *repoState) forceRefresh(root string) string {
+	budget := refreshBudget()
+	rs.requestRefresh(root)
+	rs.waitSettled(budget)
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.inFlight {
+		return fmt.Sprintf("git status still running after %s", budget)
+	}
+	return rs.lastError
+}
+
 // waitSettled blocks until no fetch is running for this repo, or until
 // budget runs out, whichever comes first.
 func (rs *repoState) waitSettled(budget time.Duration) {
@@ -607,16 +634,34 @@ func (d *daemonState) handleConn(conn net.Conn) {
 	if !sc.Scan() {
 		return
 	}
-	cwd := sc.Text()
+	cwd, refresh := strings.CutPrefix(sc.Text(), refreshPrefix)
+	if refresh {
+		conn.SetDeadline(time.Now().Add(refreshBudget() + time.Second))
+	}
+
+	// A relative cwd would be resolved against the daemon's own working
+	// directory, which is wherever the shell that spawned it happened to be.
+	var root string
+	var isRepo bool
+	if filepath.IsAbs(cwd) {
+		root, isRepo = findRepoRoot(cwd)
+	}
 
 	resp := daemonResponse{}
-	if root, isRepo := findRepoRoot(cwd); isRepo {
+	if isRepo {
 		resp.IsRepo = true
 		// The command that just finished (the reason this prompt is being
 		// rendered) has already queued its inotify events - make sure
 		// they've triggered a refresh before deciding whether to wait.
 		d.drainEvents()
 		rs := d.getOrCreate(root)
+		if refresh {
+			if errMsg := rs.forceRefresh(root); errMsg != "" {
+				resp.Error = errMsg
+				json.NewEncoder(conn).Encode(resp)
+				return
+			}
+		}
 		rs.waitSettled(d.waitBudget)
 		info, ok, errMsg := rs.snapshot()
 		resp.OK = ok

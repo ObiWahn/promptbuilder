@@ -511,6 +511,11 @@ Usage:
                                  in real PS1 usage - only the shell-level
                                  comparison against the old bash prompt
                                  captures that part.
+  promptbuilder --refresh       Make the daemon rescan the current repo now and
+                                 wait until it's done, so the next prompt is
+                                 fresh. For a git alias:
+                                   git config --global alias.pro \
+                                     '!/usr/local/bin/promptbuilder --refresh'
   promptbuilder -h | --help     Show this help.
 
 Bash integration (PS1 must only reference the variable - putting the
@@ -536,6 +541,13 @@ func main() {
 	// parsing below since it takes no exit_code argument.
 	if len(os.Args) > 1 && os.Args[1] == "--daemon" {
 		runDaemon()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--refresh" {
+		if err := refreshDaemon(); err != nil {
+			fmt.Fprintln(os.Stderr, "promptbuilder:", err)
+			os.Exit(1)
+		}
 		return
 	}
 

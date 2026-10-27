@@ -152,7 +152,13 @@ than a direct `git status`, which would most likely be just as slow.
   locks) is ignored. Edits anywhere else are picked up by the first
   prompt after the cache is older than `PROMPTBUILDER_REFRESH_INTERVAL`
   (default `30s`). There is no background rescan: while no prompt asks,
-  the daemon runs no git at all.
+  the daemon runs no git at all. To force a rescan right away,
+  `promptbuilder --refresh` makes the daemon rescan the current repo and
+  waits until it's done, e.g. as a git alias:
+
+  ```bash
+  git config --global alias.pro '!/usr/local/bin/promptbuilder --refresh'
+  ```
 - A change that lands while a refresh is already running is never
   dropped: the running `git status` is simply repeated once it finishes.
 - Each request first processes any inotify events already queued (the

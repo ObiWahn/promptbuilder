@@ -204,11 +204,23 @@ func settle(t *testing.T, d *daemonState, root string) {
 // response struct may not have yet.
 func query(t *testing.T, d *daemonState, cwd string) (resp daemonResponse, raw map[string]any) {
 	t.Helper()
+	return request(t, d, cwd)
+}
+
+// queryRefresh sends what `promptbuilder --refresh` sends.
+func queryRefresh(t *testing.T, d *daemonState, cwd string) daemonResponse {
+	t.Helper()
+	resp, _ := request(t, d, refreshPrefix+cwd)
+	return resp
+}
+
+func request(t *testing.T, d *daemonState, line string) (resp daemonResponse, raw map[string]any) {
+	t.Helper()
 	client, server := net.Pipe()
 	defer client.Close()
 	go d.handleConn(server)
 	client.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := client.Write([]byte(cwd + "\n")); err != nil {
+	if _, err := client.Write([]byte(line + "\n")); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
 	body, err := io.ReadAll(client)
@@ -478,6 +490,67 @@ func TestStaleCacheRefreshesOnRequestNotWhileIdle(t *testing.T) {
 	}
 	if n := statusCalls() - before; n != 1 {
 		t.Fatalf("%d git status calls for the request, want 1", n)
+	}
+}
+
+// A forced refresh (`git pro`) sees an edit nothing else would pick up yet:
+// outside the hot dirs, with a cache far from stale.
+func TestRefreshSeesUnwatchedEdit(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "h1", "h2", "h3", "h4", "h5", "h6")
+	statusCalls := countGitStatus(t)
+	d := newTestDaemon(t)
+	waitInfo(t, d, work, "clean", func(gi gitInfo) bool { return !gi.Unstaged })
+	settle(t, d, work)
+
+	writeFile(t, work, "h1/f.txt", "edited\n") // h1 is not hot
+	before := statusCalls()
+	resp := queryRefresh(t, d, work)
+	if !resp.OK || !resp.Info.Unstaged {
+		t.Fatalf("want Unstaged right after refresh, got %+v", resp)
+	}
+	if info, _, _ := d.getOrCreate(work).snapshot(); !info.Unstaged {
+		t.Fatalf("refresh answered, but the cache for %s was not rescanned", work)
+	}
+	if n := statusCalls() - before; n != 1 {
+		t.Fatalf("%d git status calls for the refresh, want 1", n)
+	}
+}
+
+// A refresh that arrives while a scan is already running must wait for a
+// scan that started after it - the running one may have missed the edit.
+func TestRefreshDuringRunningScanWaitsForNewScan(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "h1", "h2", "h3", "h4", "h5", "h6")
+	d := newTestDaemon(t)
+	waitInfo(t, d, work, "clean", func(gi gitInfo) bool { return !gi.Unstaged })
+	settle(t, d, work)
+
+	slowGit(t, 300*time.Millisecond)
+	git(t, work, "branch", "other") // new ref: starts a scan that runs before the edit
+	d.drainEvents()
+	writeFile(t, work, "h1/f.txt", "edited\n")
+	resp := queryRefresh(t, d, work)
+	if !resp.OK || !resp.Info.Unstaged {
+		t.Fatalf("want Unstaged after refresh during a running scan, got %+v", resp)
+	}
+}
+
+// A relative cwd must not be resolved against the daemon's own working
+// directory, which is wherever the shell that spawned it happened to be.
+func TestRelativeCwdIsNotARepo(t *testing.T) {
+	work, _ := fixture(t)
+	t.Chdir(work)
+	d := newTestDaemon(t)
+	if resp, _ := query(t, d, "."); resp.IsRepo {
+		t.Fatalf("relative cwd resolved to a repo: %+v", resp)
+	}
+}
+
+func TestRefreshOutsideRepoFails(t *testing.T) {
+	d := newTestDaemon(t)
+	if resp := queryRefresh(t, d, t.TempDir()); resp.IsRepo || resp.OK {
+		t.Fatalf("want not-a-repo answer, got %+v", resp)
 	}
 }
 
