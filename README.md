@@ -149,8 +149,10 @@ than a direct `git status`, which would most likely be just as slow.
   the repo is. Refreshes they trigger are rate-limited to one per second
   per repo, with the last write of a burst always picked up, and editor
   noise (vim swap files and its `4913` probe, `*~` backups, emacs `.#*`
-  locks) is ignored. Edits anywhere else are picked up by the periodic
-  tick (`PROMPTBUILDER_REFRESH_INTERVAL`, default `30s`).
+  locks) is ignored. Edits anywhere else are picked up by the first
+  prompt after the cache is older than `PROMPTBUILDER_REFRESH_INTERVAL`
+  (default `30s`). There is no background rescan: while no prompt asks,
+  the daemon runs no git at all.
 - A change that lands while a refresh is already running is never
   dropped: the running `git status` is simply repeated once it finishes.
 - Each request first processes any inotify events already queued (the
@@ -167,7 +169,7 @@ than a direct `git status`, which would most likely be just as slow.
   to track - a new daemon spawns on demand the next time one's needed.
 - A failed fetch (timeout, lock contention, a huge repo just taking a
   while) never gets stuck: it doesn't overwrite good cached data, and it
-  leaves the repo's refresh timer stale so the very next tick (~1s)
+  leaves the repo's refresh timer stale so the very next prompt
   retries, instead of the repo appearing broken for a full refresh
   interval or longer.
 - `PROMPTBUILDER_GIT_TIMEOUT` (default `5s`) bounds how long a single
@@ -236,7 +238,7 @@ Blank lines and lines starting with `#` are ignored.
 Read once at daemon startup, no live reload:
 
 ```
-PROMPTBUILDER_REFRESH_INTERVAL=30s   # periodic fallback refresh
+PROMPTBUILDER_REFRESH_INTERVAL=30s   # max cache age before a prompt rescans
 PROMPTBUILDER_IDLE_EVICT=15m         # per-repo cache/watch eviction
 PROMPTBUILDER_GIT_TIMEOUT=5s         # per-call timeout before retrying
 PROMPTBUILDER_WAIT_BUDGET=300ms      # max wait per request for a running refresh

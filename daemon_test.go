@@ -20,8 +20,8 @@ import (
 const defaultFixtureRepo = "/home/claude/remote-repos/03_PROJECT/diff"
 
 // inotifyTimeout is how long a change may take to show up in the daemon's
-// cache. The periodic refresh is disabled in tests (see newTestDaemon), so
-// only inotify can explain an update within this window.
+// cache. The stale-cache refresh is pushed out of reach in tests (see
+// newTestDaemon), so only inotify can explain an update within this window.
 const inotifyTimeout = 500 * time.Millisecond
 
 // realGit is resolved once, before any test puts a slow wrapper on $PATH,
@@ -93,7 +93,7 @@ func commitFile(t *testing.T, dir, name, content string) {
 }
 
 // newTestDaemon builds daemon state the same way runDaemon does, but with
-// the periodic refresh and eviction pushed out of reach and without the
+// the stale-cache refresh and eviction pushed out of reach and without the
 // socket listener - requests go through handleConn directly (see query).
 func newTestDaemon(t *testing.T) *daemonState {
 	t.Helper()
@@ -409,8 +409,8 @@ func TestStatusDoesNotWriteIndex(t *testing.T) {
 }
 
 // Plain edits never touch .git/. In a directory where files were committed
-// recently they must still be seen right away, not only on the periodic
-// tick.
+// recently they must still be seen right away, not only once the cache is
+// stale.
 func TestEditInRecentlyCommittedDirIsSeen(t *testing.T) {
 	work, _ := fixture(t)
 	commitInDirs(t, work, "hot")
@@ -423,8 +423,7 @@ func TestEditInRecentlyCommittedDirIsSeen(t *testing.T) {
 }
 
 // Only the 5 most recently committed directories are watched: an edit in
-// each of them is seen, while the 6th most recent stays on the periodic
-// tick.
+// each of them is seen, while the 6th most recent waits for a stale cache.
 func TestOnlyFiveMostRecentDirsAreWatched(t *testing.T) {
 	work, _ := fixture(t)
 	commitInDirs(t, work, "h1", "h2", "h3", "h4", "h5", "h6")
@@ -449,6 +448,36 @@ func TestOnlyFiveMostRecentDirsAreWatched(t *testing.T) {
 		git(t, work, "checkout", "-q", "--", dir+"/f.txt")
 		waitInfo(t, d, work, "clean after checkout in "+dir, func(gi gitInfo) bool { return !gi.Unstaged })
 		settle(t, d, work)
+	}
+}
+
+// An edit outside the hot dirs is never scanned for while idle - only the
+// next request, finding the cache older than the refresh interval, scans.
+func TestStaleCacheRefreshesOnRequestNotWhileIdle(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "h1", "h2", "h3", "h4", "h5", "h6")
+	statusCalls := countGitStatus(t)
+	d := newTestDaemon(t)
+	d.refreshInterval = 300 * time.Millisecond
+	go d.housekeep(nil) // idleEvict is 1h: never evicts, never exits
+	if resp, _ := query(t, d, work); !resp.OK || resp.Info.Unstaged {
+		t.Fatalf("want clean first answer, got %+v", resp)
+	}
+	settle(t, d, work)
+
+	writeFile(t, work, "h1/f.txt", "edited\n") // h1 is not hot
+	before := statusCalls()
+	time.Sleep(1500 * time.Millisecond) // past the interval and a housekeep tick
+	if n := statusCalls() - before; n != 0 {
+		t.Fatalf("%d git status calls while idle, want none", n)
+	}
+
+	resp, _ := query(t, d, work)
+	if !resp.OK || !resp.Info.Unstaged {
+		t.Fatalf("want Unstaged from the stale-cache request, got %+v", resp)
+	}
+	if n := statusCalls() - before; n != 1 {
+		t.Fatalf("%d git status calls for the request, want 1", n)
 	}
 }
 

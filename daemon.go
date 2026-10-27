@@ -204,8 +204,8 @@ func (rs *repoState) snapshot() (gitInfo, bool, string) {
 
 // requestRefresh starts a git status fetch for root in the background and
 // returns immediately. Triggers that arrive while a fetch is already
-// running (a burst of inotify events from one git command, a periodic tick
-// on a slow repo) don't start another concurrent git process, but they
+// running (a burst of inotify events from one git command, a request
+// finding a slow repo's cache stale) don't start another concurrent git process, but they
 // aren't dropped either: they mark the state dirty, and the running fetch
 // goes around once more when it's done, so the cache always ends up
 // reflecting the latest change.
@@ -225,8 +225,8 @@ func (rs *repoState) requestRefresh(root string) {
 // run. On failure, the previous good cache and lastRefresh are left
 // untouched: findRepoRoot already confirmed a .git entry exists, so a
 // failure here is always transient (timeout, lock contention, a huge repo
-// just taking a while, ...), and leaving lastRefresh stale makes housekeep
-// retry on its very next tick instead of this repo getting stuck.
+// just taking a while, ...), and leaving lastRefresh stale makes the next
+// request retry instead of this repo getting stuck.
 func (rs *repoState) fetchLoop(root string) {
 	for {
 		gi, ok, errMsg := runGitStatus(root)
@@ -290,8 +290,9 @@ func (rs *repoState) requestWorktreeRefresh(root string) {
 // edits, which never touch .git/: the directories of currently changed or
 // untracked files first, then those of the most recently committed files,
 // up to maxHotDirs. Watches are per directory, not recursive, so the cost
-// stays flat no matter how big the repo is. Edits elsewhere are still
-// picked up by the periodic tick.
+// stays flat no matter how big the repo is. Edits elsewhere are picked up
+// by the first request after the cache is older than the refresh interval
+// (see getOrCreate).
 func (rs *repoState) updateHotDirs(root string, gi gitInfo) {
 	if gi.commit != rs.histCommit {
 		rs.histCommit = gi.commit
@@ -359,12 +360,6 @@ func (rs *repoState) waitSettled(budget time.Duration) {
 	case <-settled:
 	case <-timer.C:
 	}
-}
-
-func (rs *repoState) touch() {
-	rs.mu.Lock()
-	rs.lastAccess = time.Now()
-	rs.mu.Unlock()
 }
 
 // watch is one inotify watch descriptor. The same directory can matter to
@@ -578,12 +573,21 @@ func (d *daemonState) setHotWatches(root string, rs *repoState, dirs []string) {
 
 // getOrCreate returns the cached state for root, setting up watches and
 // starting a first fetch in the background the first time this repo is
-// seen. It never blocks on git - callers wait via waitSettled, bounded.
+// seen. A cache older than the refresh interval is refreshed too: that's
+// the only way edits outside the hot dirs are seen, and doing it here
+// rather than on a timer means nothing is scanned while nobody is asking.
+// It never blocks on git - callers wait via waitSettled, bounded.
 func (d *daemonState) getOrCreate(root string) *repoState {
 	d.mu.Lock()
 	if rs, ok := d.repos[root]; ok {
 		d.mu.Unlock()
-		rs.touch()
+		rs.mu.Lock()
+		rs.lastAccess = time.Now()
+		stale := time.Since(rs.lastRefresh) > d.refreshInterval
+		rs.mu.Unlock()
+		if stale {
+			rs.requestRefresh(root)
+		}
 		return rs
 	}
 	rs := &repoState{lastAccess: time.Now(), d: d}
@@ -629,10 +633,8 @@ func (d *daemonState) handleConn(conn net.Conn) {
 	json.NewEncoder(conn).Encode(resp)
 }
 
-// housekeep runs once a second: evicts idle repos and refreshes any repo
-// whose cache has gone stale past the refresh interval (this is only a
-// fallback for plain working-tree edits that inotify can't see - branch/
-// staged/upstream changes are already caught instantly via inotify).
+// housekeep runs once a second and evicts idle repos. It never refreshes:
+// stale caches are refreshed by the next request (see getOrCreate).
 // Exits the whole daemon once nothing is left to track.
 func (d *daemonState) housekeep(listener net.Listener) {
 	ticker := time.NewTicker(1 * time.Second)
@@ -643,17 +645,12 @@ func (d *daemonState) housekeep(listener net.Listener) {
 		for root, rs := range d.repos {
 			rs.mu.Lock()
 			idle := now.Sub(rs.lastAccess) > d.idleEvict
-			stale := now.Sub(rs.lastRefresh) > d.refreshInterval
 			wds := slices.Concat(rs.watches, rs.hotWatches)
 			rs.mu.Unlock()
 
 			if idle {
 				d.removeWatches(root, wds)
 				delete(d.repos, root)
-				continue
-			}
-			if stale {
-				rs.requestRefresh(root)
 			}
 		}
 		empty := len(d.repos) == 0
