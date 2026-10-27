@@ -86,8 +86,16 @@ the daemon, since they're meant to show/measure the real thing.
 ### Wiring it into bash
 
 ```bash
-PROMPT_COMMAND='PS1="$(promptbuilder $?)"'
+PROMPT_COMMAND='_pb_ps1=$(promptbuilder $?)'
+PS1='${_pb_ps1}'
 ```
+
+Do not write `PROMPT_COMMAND='PS1="$(promptbuilder $?)"'`: bash expands
+`$(...)` and backticks inside `PS1` itself on every render, so a
+directory or branch name like `$(rm -rf ~)` (from an extracted archive,
+or the default branch of a cloned repo) would be executed. Referencing a
+variable is safe - its value isn't expanded a second time. This is the
+same fix git's own `git-prompt.sh` uses.
 
 To try it in your current shell first, without touching `~/.bashrc.d`:
 
@@ -156,6 +164,27 @@ Singleton safety (only one daemon ever runs) comes from the daemon's own
 `Listen()` on the socket path being the actual lock - see
 `~/remote-repos/patterns/unix-socket-daemon-spawning.md` for the general
 pattern this follows, independent of this project.
+
+## Security
+
+- **PS1 wiring**: see "Wiring it into bash" - PS1 must only reference a
+  variable holding the output, never contain it directly.
+- **Untrusted text**: control characters, DEL, C1 controls and invalid
+  UTF-8 in directory names, branch names, git error text and the
+  optional env lines are replaced with `?`, so a name can't send escape
+  sequences to the terminal (window title, clipboard via OSC 52, ...).
+- **Socket**: client and daemon both check, via `SO_PEERCRED`, that the
+  other end runs as the same user. Without `$XDG_RUNTIME_DIR` the socket
+  goes in `$TMPDIR/promptbuilder-<uid>/` (default `/tmp`), which is only
+  used if it is a real directory owned by you with mode `0700` -
+  otherwise there's no daemon and git runs directly.
+- **git in untrusted repos**: all git calls run with
+  `-c core.fsmonitor=false`, so a repo's own `.git/config` can't make
+  `git status` run a command. Other repo-configured commands that
+  `git status` may run (e.g. a `filter.<name>.clean` driver applied via
+  `.gitattributes`) can't be switched off generically - the same
+  limitation every prompt that shows git status has. `git clone` never
+  copies `.git/config`; extracted archives and shared directories can.
 
 ## Configuration
 

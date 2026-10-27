@@ -37,7 +37,9 @@ func resolveGit() gitResult {
 		return gr
 	}
 
-	spawnDaemon()
+	if socketPath() != "" { // no safe socket location: a daemon couldn't start anyway
+		spawnDaemon()
+	}
 	return directGitResult(cwd)
 }
 
@@ -48,11 +50,18 @@ func resolveGit() gitResult {
 // would most likely be just as slow, so gr is instead a pending result
 // with only the branch, read straight from HEAD.
 func tryDaemon(cwd string) (gr gitResult, reached bool) {
-	conn, err := net.DialTimeout("unix", socketPath(), daemonDialTimeout)
+	path := socketPath()
+	if path == "" {
+		return gitResult{}, false
+	}
+	conn, err := net.DialTimeout("unix", path, daemonDialTimeout)
 	if err != nil {
 		return gitResult{}, false
 	}
 	defer conn.Close()
+	if !peerIsTrusted(conn) {
+		return gitResult{}, false // not our daemon - don't believe a word
+	}
 	conn.SetDeadline(time.Now().Add(daemonResponseTimeout))
 
 	if _, err := conn.Write([]byte(cwd + "\n")); err != nil {

@@ -136,15 +136,25 @@ func directGitResult(dir string) gitResult {
 // callers only reach this once they already know dir is a real repo (via
 // findRepoRoot), so a failure here is always a genuine error, never "turns
 // out this wasn't a repo".
+// gitCommand runs git in dir with the options every call here needs:
+//   - --no-optional-locks: plain `git status` opportunistically rewrites
+//     .git/index (taking index.lock), which contends with the user's own
+//     git commands and makes the daemon's inotify watch fire on itself.
+//   - core.fsmonitor=false: otherwise git status runs the command named by
+//     the repo's own .git/config, which whoever made the repo controls
+//     (an extracted archive, a shared directory).
+func gitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git",
+		append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false"}, args...)...)
+	cmd.Dir = dir
+	return cmd
+}
+
 func runGitStatus(dir string) (gitInfo, bool, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout())
 	defer cancel()
 
-	// --no-optional-locks: plain `git status` opportunistically rewrites
-	// .git/index (taking index.lock), which contends with the user's own git
-	// commands and makes the daemon's inotify watch fire on itself.
-	cmd := exec.CommandContext(ctx, "git", "--no-optional-locks", "status", "--porcelain=v2", "--branch")
-	cmd.Dir = dir
+	cmd := gitCommand(ctx, dir, "status", "--porcelain=v2", "--branch")
 	out, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -239,6 +249,30 @@ func (gi *gitInfo) addChangedDir(path string) {
 	}
 }
 
+// printable replaces anything a terminal would act on rather than print
+// - C0 controls (ESC starts escape sequences: window title, clipboard via
+// OSC 52, clearing the screen, ...), DEL, C1 controls, and invalid UTF-8,
+// whose lone bytes some terminals read as C1 controls (0x9b = CSI) - with
+// '?'. Every piece of text in the prompt goes through this: directory and
+// branch names can contain such bytes.
+func printable(s string) string {
+	isBad := func(r rune) bool {
+		return r < 0x20 || (r >= 0x7f && r <= 0x9f) || r == utf8.RuneError
+	}
+	if !strings.ContainsFunc(s, isBad) {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if isBad(r) {
+			b.WriteByte('?')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func displayPath(home, cwd string) string {
 	if cwd == home {
 		return "~"
@@ -260,11 +294,11 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 	// linker + NSS resolution cost on every single fork+exec. A bash shell
 	// always exports $USER/$HOME already, and os.Getuid() is a plain
 	// syscall - so there's no need for it here.
-	username := os.Getenv("USER")
+	username := printable(os.Getenv("USER"))
 	uid := os.Getuid()
 	home := os.Getenv("HOME")
 
-	hostname, _ := os.Hostname()
+	hostname := printable(mustHostname())
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "?"
@@ -279,14 +313,14 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 	sb.WriteString(hostname)
 	sb.WriteString(reset)
 	sb.WriteString(esc(userColor(username, uid)))
-	sb.WriteString(":" + displayPath(home, cwd))
+	sb.WriteString(":" + printable(displayPath(home, cwd)))
 	sb.WriteString(reset)
 	sb.WriteString("\n")
 
 	// $debian_chroot is presence-checked (shown even if set-but-empty), same
 	// as the original's "${debian_chroot+chroot: $debian_chroot}".
 	if v, set := os.LookupEnv("debian_chroot"); set {
-		sb.WriteString("chroot: " + v + "\n")
+		sb.WriteString("chroot: " + printable(v) + "\n")
 	}
 
 	fetchGit := func() gitResult { return directGitResult("") }
@@ -301,7 +335,7 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 		// exactly what made the underlying bug confusing to notice.
 		sb.WriteString("git: ")
 		sb.WriteString(esc(sgrRed))
-		sb.WriteString("error: " + gr.Error)
+		sb.WriteString("error: " + printable(gr.Error))
 		sb.WriteString(reset)
 		sb.WriteString("\n")
 	} else {
@@ -312,7 +346,7 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 		}
 		sb.WriteString("git: ")
 		sb.WriteString(esc(branchSGR))
-		sb.WriteString(gi.Branch)
+		sb.WriteString(printable(gi.Branch))
 		sb.WriteString(reset)
 		// The original inserts exactly one space before the flags block as a
 		// whole (only if there's anything to show), never between the
@@ -354,19 +388,19 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 	// $GOPATH: shown only if non-empty and not the default $HOME/.go,
 	// matching the original's _get_go_PROMPT.
 	if gopath := os.Getenv("GOPATH"); gopath != "" && gopath != home+"/.go" {
-		sb.WriteString("go: " + gopath + "\n")
+		sb.WriteString("go: " + printable(gopath) + "\n")
 	}
 
 	// $TOOLCHAIN_PREFIX, $DOCKER_HOST, $PROMPT_EXTRA: all presence-checked
 	// and shown verbatim (or prefixed), same as the original.
 	if v, set := os.LookupEnv("TOOLCHAIN_PREFIX"); set {
-		sb.WriteString(v + "\n")
+		sb.WriteString(printable(v) + "\n")
 	}
 	if v, set := os.LookupEnv("DOCKER_HOST"); set {
-		sb.WriteString("DOCKER_HOST=" + v + "\n")
+		sb.WriteString("DOCKER_HOST=" + printable(v) + "\n")
 	}
 	if v, set := os.LookupEnv("PROMPT_EXTRA"); set {
-		sb.WriteString(v + "\n")
+		sb.WriteString(printable(v) + "\n")
 	}
 
 	exitSGR := sgrBoldGreen
@@ -479,8 +513,10 @@ Usage:
                                  captures that part.
   promptbuilder -h | --help     Show this help.
 
-Bash integration:
-  PROMPT_COMMAND='PS1="$(promptbuilder $?)"'
+Bash integration (PS1 must only reference the variable - putting the
+output into PS1 directly lets bash execute $(...) in directory/branch names):
+  PROMPT_COMMAND='_pb_ps1=$(promptbuilder $?)'
+  PS1='${_pb_ps1}'
 `
 
 // isTerminalStdout reports whether stdout is an interactive terminal rather

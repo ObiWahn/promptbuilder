@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -54,11 +54,53 @@ type daemonResponse struct {
 	Info    gitInfo `json:"info"`
 }
 
+// trustedUID is the only user whose processes the client and the daemon
+// talk to over the socket.
+var trustedUID = os.Getuid()
+
+// peerIsTrusted reports whether the process at the other end of conn runs
+// as trustedUID, as reported by the kernel (SO_PEERCRED). The client uses
+// it so another user's process squatting on the socket path can't feed
+// text into the prompt; the daemon uses it so nobody else can make it run
+// git status, as its owner, in a directory of their choosing.
+func peerIsTrusted(conn net.Conn) bool {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return false
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return false
+	}
+	var cred *syscall.Ucred
+	var credErr error
+	err = raw.Control(func(fd uintptr) {
+		cred, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+	})
+	return err == nil && credErr == nil && int(cred.Uid) == trustedUID
+}
+
+// socketPath returns where the daemon's socket lives, or "" if there is no
+// safe place for it (then the client always runs git directly).
+// $XDG_RUNTIME_DIR is private to the user by definition. The fallback is a
+// subdirectory of the shared temp dir, which is only used if it is really
+// ours: another user could have created that path first.
 func socketPath() string {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, "promptbuilder.sock")
 	}
-	return fmt.Sprintf("/tmp/promptbuilder-%d.sock", os.Getuid())
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("promptbuilder-%d", os.Getuid()))
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return ""
+	}
+	fi, err := os.Lstat(dir) // Lstat: a symlink is refused, not followed
+	if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		return ""
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Getuid() {
+		return ""
+	}
+	return filepath.Join(dir, "sock")
 }
 
 // findRepoRoot walks up from dir looking for a .git entry, without
@@ -117,11 +159,13 @@ func headInfo(root string) gitInfo {
 		return gitInfo{}
 	}
 	head := strings.TrimSpace(string(b))
+	// Unlike git's own output, HEAD's content isn't validated by anyone -
+	// keep it to printable text.
 	if ref, ok := strings.CutPrefix(head, "ref: "); ok {
-		return gitInfo{Branch: strings.TrimPrefix(ref, "refs/heads/")}
+		return gitInfo{Branch: printable(strings.TrimPrefix(ref, "refs/heads/"))}
 	}
 	if len(head) >= 7 {
-		return gitInfo{Branch: head[:7], Detached: true}
+		return gitInfo{Branch: printable(head[:7]), Detached: true}
 	}
 	return gitInfo{}
 }
@@ -279,10 +323,8 @@ func (rs *repoState) updateHotDirs(root string, gi gitInfo) {
 func recentDirs(root string) []string {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout())
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "--no-optional-locks", "log",
-		"-n", strconv.Itoa(historyCommits), "--name-only", "--format=", "--no-renames", "HEAD")
-	cmd.Dir = root
-	out, err := cmd.Output()
+	out, err := gitCommand(ctx, root, "log",
+		"-n", strconv.Itoa(historyCommits), "--name-only", "--format=", "--no-renames", "HEAD").Output()
 	if err != nil {
 		return nil // e.g. no commits yet
 	}
@@ -432,7 +474,12 @@ func isEditorNoise(name string) bool {
 
 // addWatch must be called with d.mu held.
 func (d *daemonState) addWatch(root, path string, kind watchKind) (int, bool) {
-	wd, err := syscall.InotifyAddWatch(d.inotifyFd, path, inotifyMask)
+	mask := uint32(inotifyMask)
+	if kind == watchWorktree {
+		// A symlinked directory in the working tree may point anywhere.
+		mask |= syscall.IN_DONT_FOLLOW | syscall.IN_ONLYDIR
+	}
+	wd, err := syscall.InotifyAddWatch(d.inotifyFd, path, mask)
 	if err != nil {
 		return 0, false
 	}
@@ -445,12 +492,20 @@ func (d *daemonState) addWatch(root, path string, kind watchKind) (int, bool) {
 	return wd, true
 }
 
+// maxRefsDirs bounds how many directories under refs/ get watched, so a
+// hand-made .git pointing its common dir at some huge tree can't make the
+// daemon walk and watch all of it.
+const maxRefsDirs = 1000
+
 // addRefsWatches watches dir and every directory below it, so refs in
 // nested namespaces (refs/heads/feature/x, refs/remotes/origin/main) are
 // covered. Must be called with d.mu held.
 func (d *daemonState) addRefsWatches(root, dir string) []int {
 	var wds []int
 	filepath.WalkDir(dir, func(path string, e fs.DirEntry, err error) error {
+		if len(wds) >= maxRefsDirs {
+			return filepath.SkipAll
+		}
 		if err != nil || !e.IsDir() {
 			return nil
 		}
@@ -733,6 +788,10 @@ func (d *daemonState) dispatch(buf []byte) {
 // pattern this follows.
 func runDaemon() {
 	path := socketPath()
+	if path == "" {
+		fmt.Fprintln(os.Stderr, "promptbuilder --daemon: no private directory for the socket")
+		os.Exit(1)
+	}
 
 	listener, err := net.Listen("unix", path)
 	if err != nil {
@@ -764,6 +823,10 @@ func runDaemon() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
+		}
+		if !peerIsTrusted(conn) {
+			conn.Close()
+			continue
 		}
 		go d.handleConn(conn)
 	}
