@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Runs `make check-secrets` before every commit (from the gitleaks skill).
+# Activated by `make git-hooks` (git config core.hooksPath .githooks).
+set -uo pipefail
+
+ferr() { echo "ERROR: $*"; exit 1; }
+
+top=$(git rev-parse --show-toplevel) || ferr "not inside a git worktree"
+make -C "$top" check-secrets || ferr "check-secrets failed, see the log named in its tee line above"
