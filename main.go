@@ -515,7 +515,7 @@ Usage:
 
 Bash integration (PS1 must only reference the variable - putting the
 output into PS1 directly lets bash execute $(...) in directory/branch names):
-  PROMPT_COMMAND='_pb_ps1=$(promptbuilder $?)'
+  PROMPT_COMMAND='_pb_ps1=$(/usr/local/bin/promptbuilder $?)'
   PS1='${_pb_ps1}'
 `
 

@@ -44,17 +44,27 @@ git: branch [+][*][<\|>\|<>\|=]
 
 ```
 make build    # ./promptbuilder, for poking around locally
-make install  # $BINDIR/promptbuilder, default $BINDIR = ~/.bin
+make install  # /usr/local/bin/promptbuilder, root-owned (asks for sudo)
 make fmt      # gofmt + go vet
 make test     # go test ./...
 make clean    # remove build artifacts
 ```
 
-Always use the installed binary (`make install`, with `~/.bin` on your
-`$PATH`) rather than running `./promptbuilder` from this directory for
-real use - the daemon re-execs whatever path it was originally invoked
-from, so running the local build makes a background daemon depend on a
-file you're actively rebuilding.
+Always use the installed binary, `/usr/local/bin/promptbuilder`, called
+by that full path, rather than running `./promptbuilder` from this
+directory for real use:
+
+- It runs on every prompt render, so it must not be replaceable by
+  anything running as you. `make install` builds as you, then installs
+  it with `sudo install -o root -g root -m 0755`, so the binary and every
+  directory above it are owned by root and not writable by group or
+  others.
+- Calling it by full path means `$PATH` is never searched, so a
+  `promptbuilder` earlier in `$PATH` (a user-writable `~/.bin`, a `.` entry,
+  a repo's `bin/`) can't take its place.
+- The daemon re-execs whatever path it was originally invoked from, so
+  running the local build makes a background daemon depend on a file
+  you're actively rebuilding.
 
 If a daemon from a previous build is still running, `make restart-daemon`
 kills it so a fresh one (matching whatever you just built) picks up on
@@ -86,11 +96,13 @@ the daemon, since they're meant to show/measure the real thing.
 ### Wiring it into bash
 
 ```bash
-PROMPT_COMMAND='_pb_ps1=$(promptbuilder $?)'
+PROMPT_COMMAND='_pb_ps1=$(/usr/local/bin/promptbuilder $?)'
 PS1='${_pb_ps1}'
 ```
 
-Do not write `PROMPT_COMMAND='PS1="$(promptbuilder $?)"'`: bash expands
+Call the binary by its full path (see Build / install for why).
+
+Do not write `PROMPT_COMMAND='PS1="$(/usr/local/bin/promptbuilder $?)"'`: bash expands
 `$(...)` and backticks inside `PS1` itself on every render, so a
 directory or branch name like `$(rm -rf ~)` (from an extracted archive,
 or the default branch of a cloned repo) would be executed. Referencing a
@@ -100,11 +112,15 @@ same fix git's own `git-prompt.sh` uses.
 To try it in your current shell first, without touching `~/.bashrc.d`:
 
 ```bash
-source /path/to/bash-prompt/try-prompt.sh
+source /path/to/bash-prompt/try-prompt.bash
 ```
 
-This defines `promptbuilder_activate` / `promptbuilder_restore` so you
-can toggle back and forth as many times as you like in that shell.
+It uses this repo's own build (`make build`), called by its absolute
+path; `promptbuilder_activate /path/to/promptbuilder` switches to another
+binary. It's meant for trying changes - your real prompt should use the
+root-owned installed binary. This defines
+`promptbuilder_activate` / `promptbuilder_restore` so you can toggle
+back and forth as many times as you like in that shell.
 
 ## The caching daemon
 
@@ -169,6 +185,9 @@ pattern this follows, independent of this project.
 
 - **PS1 wiring**: see "Wiring it into bash" - PS1 must only reference a
   variable holding the output, never contain it directly.
+- **Binary**: called by full path (`/usr/local/bin/promptbuilder`), never
+  looked up in `$PATH`, and root-owned so nothing running as you can
+  replace it - see Build / install.
 - **Untrusted text**: control characters, DEL, C1 controls and invalid
   UTF-8 in directory names, branch names, git error text and the
   optional env lines are replaced with `?`, so a name can't send escape
@@ -231,5 +250,5 @@ daemon.go       the caching daemon: repo cache, inotify, eviction
 client.go       daemon client + the detached-spawn logic
 colors.go       user/host color config loading
 GNUmakefile     build / install / fmt / test / restart-daemon / clean
-try-prompt.sh   session-scoped way to try the prompt without editing bashrc
+try-prompt.bash session-scoped way to try the prompt without editing bashrc
 ```

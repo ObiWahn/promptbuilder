@@ -29,7 +29,9 @@ func buildBinary(t *testing.T) (binDir string) {
 // prompt, so anything attacker-controlled that ends up in the prompt text
 // (a directory name from an extracted archive, the default branch name of
 // a cloned repo) must never be executed. Checked with the shipped wiring
-// from try-prompt.sh, driven by a real bash.
+// from try-prompt.bash, driven by a real bash. A fake promptbuilder on
+// $PATH checks that the binary is called by its full path, never looked
+// up.
 func TestPromptDoesNotExecuteNames(t *testing.T) {
 	bin := buildBinary(t)
 	tmp := t.TempDir()
@@ -49,15 +51,22 @@ func TestPromptDoesNotExecuteNames(t *testing.T) {
 	git(t, repo, "switch", "-q", "-c", "$(touch${IFS}PWNED_BRANCH)")
 	dirs = append(dirs, repo)
 
+	fakeBin := t.TempDir()
+	fake := "#!/usr/bin/env bash\ntouch PWNED_PATH_LOOKUP\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "promptbuilder"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	for _, dir := range dirs {
-		script := `source "$1" >/dev/null || exit 1
+		script := `source "$1" >/dev/null 2>&1
+promptbuilder_activate "$3" >/dev/null || exit 1
 cd "$2" || exit 1
 eval "$PROMPT_COMMAND"
 printf '%s' "${PS1@P}"`
 		cmd := exec.Command("bash", "--norc", "--noprofile", "-c", script, "bash",
-			filepath.Join(mustGetwd(t), "try-prompt.sh"), dir)
+			filepath.Join(mustGetwd(t), "try-prompt.bash"), dir, filepath.Join(bin, "promptbuilder"))
 		cmd.Env = append(os.Environ(),
-			"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"XDG_RUNTIME_DIR="+filepath.Join(tmp, "no-such-dir"), // no daemon
 		)
 		out, err := cmd.CombinedOutput()
@@ -77,6 +86,45 @@ printf '%s' "${PS1@P}"`
 	more, _ := filepath.Glob(filepath.Join(tmp, "PWNED_*"))
 	if all := append(pwned, more...); len(all) > 0 {
 		t.Errorf("prompt executed commands from names, created: %v", all)
+	}
+}
+
+// try-prompt.bash is for trying the repo's own build: without an argument
+// it uses the promptbuilder next to it - resolved to an absolute path even
+// when sourced via a relative one - and refuses to activate if there is
+// none.
+func TestTryPromptDefaultsToRepoBuild(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join(mustGetwd(t), "try-prompt.bash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "try-prompt.bash"), src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func() string {
+		code := `cd "$1" && source repo/try-prompt.bash >/dev/null; cd /
+eval "$PROMPT_COMMAND"
+printf 'PROMPT_COMMAND=[%s] out=[%s]' "$PROMPT_COMMAND" "$_pb_ps1"`
+		out, _ := exec.Command("bash", "--norc", "--noprofile", "-c", code, "bash", base).CombinedOutput()
+		return string(out)
+	}
+
+	if out := run(); !strings.Contains(out, "make build") || !strings.Contains(out, "PROMPT_COMMAND=[]") {
+		t.Errorf("activated without a repo build:\n%s", out)
+	}
+
+	fake := "#!/usr/bin/env bash\nprintf REPO_BUILD\n"
+	if err := os.WriteFile(filepath.Join(repo, "promptbuilder"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := run()
+	if !strings.Contains(out, filepath.Join(repo, "promptbuilder")) || !strings.Contains(out, "out=[REPO_BUILD]") {
+		t.Errorf("didn't run the repo build by absolute path:\n%s", out)
 	}
 }
 

@@ -1,7 +1,7 @@
 SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-BINDIR      ?= $(HOME)/.bin
+BINDIR      ?= /usr/local/bin
 BUILD_DIR   := .build
 TEST_TIMEOUT := 30s
 LDFLAGS     := -s -w
@@ -16,9 +16,10 @@ $(BUILD_DIR):
 build: $(BUILD_DIR)
 	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o promptbuilder . 2>&1 | tee $(BUILD_DIR)/build.log
 
-install: $(BUILD_DIR)
-	mkdir -p $(BINDIR)
-	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o $(BINDIR)/promptbuilder . 2>&1 | tee $(BUILD_DIR)/install.log
+# Built as you, installed root-owned: the binary runs on every prompt
+# render, so nothing running as you may be able to replace it.
+install: build
+	sudo install -o root -g root -m 0755 promptbuilder $(BINDIR)/promptbuilder 2>&1 | tee $(BUILD_DIR)/install.log
 
 fmt: $(BUILD_DIR)
 	gofmt -l -w . && go vet ./... 2>&1 | tee $(BUILD_DIR)/fmt.log
