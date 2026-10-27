@@ -116,9 +116,17 @@ than a direct `git status`, which would most likely be just as slow.
   push/fetch update ahead/behind, tags). Directories are watched rather
   than the files themselves, since git replaces those files by renaming
   `X.lock` over them. Linked worktrees (`.git` as a file) are followed to
-  their git dir and common dir. A periodic tick
-  (`PROMPTBUILDER_REFRESH_INTERVAL`, default `30s`) remains as the fallback
-  for plain unstaged edits that never touch `.git/`.
+  their git dir and common dir.
+- Plain edits never touch `.git/`, so the daemon also watches up to 5
+  "hot" working-tree directories per repo: those holding currently
+  changed or untracked files first, then those of the most recently
+  committed files (last 50 commits, recomputed whenever HEAD moves).
+  These watches are not recursive, so the cost stays flat however big
+  the repo is. Refreshes they trigger are rate-limited to one per second
+  per repo, with the last write of a burst always picked up, and editor
+  noise (vim swap files and its `4913` probe, `*~` backups, emacs `.#*`
+  locks) is ignored. Edits anywhere else are picked up by the periodic
+  tick (`PROMPTBUILDER_REFRESH_INTERVAL`, default `30s`).
 - A change that lands while a refresh is already running is never
   dropped: the running `git status` is simply repeated once it finishes.
 - Each request first processes any inotify events already queued (the

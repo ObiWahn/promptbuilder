@@ -407,3 +407,128 @@ func TestStatusDoesNotWriteIndex(t *testing.T) {
 			inode(before), inode(after), before.ModTime(), after.ModTime())
 	}
 }
+
+// Plain edits never touch .git/. In a directory where files were committed
+// recently they must still be seen right away, not only on the periodic
+// tick.
+func TestEditInRecentlyCommittedDirIsSeen(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "hot")
+	d := newTestDaemon(t)
+	waitInfo(t, d, work, "clean", func(gi gitInfo) bool { return !gi.Unstaged })
+	settle(t, d, work)
+
+	writeFile(t, work, "hot/f.txt", "edited\n")
+	waitInfo(t, d, work, "Unstaged after edit", func(gi gitInfo) bool { return gi.Unstaged })
+}
+
+// Only the 5 most recently committed directories are watched: an edit in
+// each of them is seen, while the 6th most recent stays on the periodic
+// tick.
+func TestOnlyFiveMostRecentDirsAreWatched(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "h1", "h2", "h3", "h4", "h5", "h6")
+	d := newTestDaemon(t)
+	waitInfo(t, d, work, "clean", func(gi gitInfo) bool { return !gi.Unstaged })
+	settle(t, d, work)
+
+	writeFile(t, work, "h1/f.txt", "edited\n")
+	time.Sleep(inotifyTimeout)
+	if info, _, _ := d.getOrCreate(work).snapshot(); info.Unstaged {
+		t.Fatalf("edit in h1 (6th most recent dir) was seen, want it unwatched")
+	}
+	git(t, work, "checkout", "-q", "--", "h1/f.txt") // clean again
+	settle(t, d, work)
+
+	for _, dir := range []string{"h6", "h5", "h4", "h3", "h2"} {
+		// Each edit is checked out again right after it's seen. Every
+		// round is a fresh trigger, so allow for the 1/s rate limit.
+		writeFile(t, work, dir+"/f.txt", "edited\n")
+		waitInfoTimeout(t, d, work, "Unstaged after edit in "+dir, 1500*time.Millisecond,
+			func(gi gitInfo) bool { return gi.Unstaged })
+		git(t, work, "checkout", "-q", "--", dir+"/f.txt")
+		waitInfo(t, d, work, "clean after checkout in "+dir, func(gi gitInfo) bool { return !gi.Unstaged })
+		settle(t, d, work)
+	}
+}
+
+// Directories with uncommitted changes count as the most recent history:
+// a new file next to a modified one is seen.
+func TestNewFileNextToModifiedFileIsSeen(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "h1", "h2", "h3", "h4", "h5", "h6")
+	writeFile(t, work, "h1/f.txt", "modified\n") // h1 is too old in history, but dirty
+	d := newTestDaemon(t)
+	waitInfo(t, d, work, "Unstaged, nothing untracked", func(gi gitInfo) bool { return gi.Unstaged && !gi.Untracked })
+	settle(t, d, work)
+
+	writeFile(t, work, "h1/new.txt", "new\n")
+	waitInfo(t, d, work, "Untracked after new file", func(gi gitInfo) bool { return gi.Untracked })
+}
+
+// The set follows history: a directory committed to after the daemon
+// started tracking the repo becomes watched.
+func TestHotDirsFollowNewCommits(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "h1", "h2", "h3", "h4", "h5")
+	d := newTestDaemon(t)
+	waitInfo(t, d, work, "Ahead=5", func(gi gitInfo) bool { return gi.Ahead == 5 })
+	settle(t, d, work)
+
+	commitInDirs(t, work, "late")
+	waitInfo(t, d, work, "Ahead=6 after commit", func(gi gitInfo) bool { return gi.Ahead == 6 })
+	settle(t, d, work)
+	writeFile(t, work, "late/f.txt", "edited\n")
+	waitInfoTimeout(t, d, work, "Unstaged after edit in late", 1500*time.Millisecond,
+		func(gi gitInfo) bool { return gi.Unstaged })
+}
+
+// Editors write swap/backup files next to the file being edited, often
+// every few seconds - those must not cause a git status each time.
+func TestEditorFilesDoNotTriggerRefresh(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "hot")
+	statusCalls := countGitStatus(t)
+	d := newTestDaemon(t)
+	waitInfo(t, d, work, "initial status", func(gitInfo) bool { return true })
+	settle(t, d, work)
+	before := statusCalls()
+
+	for i := 0; i < 5; i++ {
+		for _, name := range []string{".f.txt.swp", ".f.txt.swx", "f.txt~", "4913", ".#f.txt"} {
+			writeFile(t, work, "hot/"+name, fmt.Sprintf("%d\n", i))
+		}
+		os.Remove(filepath.Join(work, "hot", "4913"))
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(inotifyTimeout)
+	if n := statusCalls() - before; n != 0 {
+		t.Errorf("editor temp files caused %d git status calls, want 0", n)
+	}
+}
+
+// A burst of saves (or a build writing into a watched directory) must not
+// run git status for every single write - at most about one per second -
+// but the last write must still be reflected.
+func TestWorktreeRefreshIsRateLimited(t *testing.T) {
+	work, _ := fixture(t)
+	commitInDirs(t, work, "hot")
+	statusCalls := countGitStatus(t)
+	d := newTestDaemon(t)
+	waitInfo(t, d, work, "clean", func(gi gitInfo) bool { return !gi.Unstaged })
+	settle(t, d, work)
+	before := statusCalls()
+
+	for i := 0; i < 20; i++ {
+		writeFile(t, work, "hot/f.txt", fmt.Sprintf("save %d\n", i))
+		time.Sleep(50 * time.Millisecond) // 20 saves over ~1s
+	}
+	if n := statusCalls() - before; n > 3 {
+		t.Errorf("%d git status calls for ~1s of saves, want at most ~1/s", n)
+	}
+
+	// The last write in a burst is never lost to the rate limit.
+	writeFile(t, work, "hot/new.txt", "last\n")
+	waitInfoTimeout(t, d, work, "Untracked after the last write", 1500*time.Millisecond,
+		func(gi gitInfo) bool { return gi.Untracked })
+}

@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,6 +31,17 @@ const (
 	// before it. Small repos finish well within this; huge ones get the
 	// previous state instead of blocking the prompt.
 	defaultWaitBudget = 300 * time.Millisecond
+
+	// worktreeRefreshInterval rate-limits refreshes triggered by plain
+	// edits in hot directories: an editor saving every keystroke or a
+	// build writing into a watched directory costs at most one git status
+	// per interval. The last write is never lost - a refresh is scheduled
+	// for the end of the interval instead.
+	worktreeRefreshInterval = time.Second
+
+	// historyCommits is how far back recentDirs looks for directories with
+	// recently committed files.
+	historyCommits = 50
 )
 
 // daemonResponse is what the daemon sends back for one request - the wire
@@ -124,6 +139,17 @@ type repoState struct {
 	inFlight    bool          // a fetch is running - see requestRefresh
 	dirty       bool          // a trigger arrived while inFlight; fetch once more afterwards
 	settled     chan struct{} // closed once inFlight goes back to false
+
+	// Hot directories - see updateHotDirs. Only touched by fetchLoop
+	// (one at a time per repo), except hotWatches, which housekeep reads
+	// for eviction and is guarded by mu.
+	d           *daemonState
+	histCommit  string   // HEAD commit histDirs was computed for
+	histDirs    []string // dirs of recently committed files, newest first
+	hotDirs     []string // currently watched, absolute
+	hotWatches  []int
+	lastWTFetch time.Time   // last worktree-triggered refresh
+	wtTimer     *time.Timer // pending rate-limited worktree refresh
 }
 
 func (rs *repoState) snapshot() (gitInfo, bool, string) {
@@ -160,6 +186,9 @@ func (rs *repoState) requestRefresh(root string) {
 func (rs *repoState) fetchLoop(root string) {
 	for {
 		gi, ok, errMsg := runGitStatus(root)
+		if ok {
+			rs.updateHotDirs(root, gi)
+		}
 
 		rs.mu.Lock()
 		if ok {
@@ -184,6 +213,93 @@ func (rs *repoState) fetchLoop(root string) {
 		rs.mu.Unlock()
 		return
 	}
+}
+
+// requestWorktreeRefresh is requestRefresh for plain working-tree edits,
+// rate-limited to one per worktreeRefreshInterval: within the interval,
+// a single refresh is scheduled for its end, so the last write of a burst
+// is still picked up.
+func (rs *repoState) requestWorktreeRefresh(root string) {
+	rs.mu.Lock()
+	if rs.wtTimer != nil {
+		rs.mu.Unlock()
+		return // already scheduled
+	}
+	wait := time.Until(rs.lastWTFetch.Add(worktreeRefreshInterval))
+	if wait > 0 {
+		rs.wtTimer = time.AfterFunc(wait, func() {
+			rs.mu.Lock()
+			rs.wtTimer = nil
+			rs.lastWTFetch = time.Now()
+			rs.mu.Unlock()
+			rs.requestRefresh(root)
+		})
+		rs.mu.Unlock()
+		return
+	}
+	rs.lastWTFetch = time.Now()
+	rs.mu.Unlock()
+	rs.requestRefresh(root)
+}
+
+// updateHotDirs picks the working-tree directories to watch for plain
+// edits, which never touch .git/: the directories of currently changed or
+// untracked files first, then those of the most recently committed files,
+// up to maxHotDirs. Watches are per directory, not recursive, so the cost
+// stays flat no matter how big the repo is. Edits elsewhere are still
+// picked up by the periodic tick.
+func (rs *repoState) updateHotDirs(root string, gi gitInfo) {
+	if gi.commit != rs.histCommit {
+		rs.histCommit = gi.commit
+		rs.histDirs = recentDirs(root)
+	}
+	var dirs []string
+	for _, rel := range slices.Concat(gi.changedDirs, rs.histDirs) {
+		if len(dirs) == maxHotDirs {
+			break
+		}
+		dir := filepath.Join(root, rel)
+		if slices.Contains(dirs, dir) {
+			continue
+		}
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			continue // deleted since, or a submodule's path shown as a file
+		}
+		dirs = append(dirs, dir)
+	}
+	if slices.Equal(dirs, rs.hotDirs) {
+		return
+	}
+	rs.hotDirs = dirs
+	rs.d.setHotWatches(root, rs, dirs)
+}
+
+// recentDirs lists the directories (relative to root) of files changed in
+// the last historyCommits commits, newest first, up to maxHotDirs.
+func recentDirs(root string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "--no-optional-locks", "log",
+		"-n", strconv.Itoa(historyCommits), "--name-only", "--format=", "--no-renames", "HEAD")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return nil // e.g. no commits yet
+	}
+	var dirs []string
+	for _, path := range strings.Split(string(out), "\n") {
+		if path == "" {
+			continue
+		}
+		dir := filepath.Dir(path)
+		if !slices.Contains(dirs, dir) {
+			dirs = append(dirs, dir)
+			if len(dirs) == maxHotDirs {
+				break
+			}
+		}
+	}
+	return dirs
 }
 
 // waitSettled blocks until no fetch is running for this repo, or until
@@ -215,10 +331,18 @@ func (rs *repoState) touch() {
 // path, so a watch belongs to a set of roots and is only removed once none
 // of them need it anymore.
 type watch struct {
-	path   string
-	isRefs bool // somewhere under refs/: every entry matters, and new subdirs get watched too
-	roots  map[string]bool
+	path  string
+	kind  watchKind
+	roots map[string]bool
 }
+
+type watchKind int
+
+const (
+	watchGitDir   watchKind = iota // a git dir or common dir: only gitDirFiles matter
+	watchRefs                      // somewhere under refs/: every entry matters, new subdirs get watched too
+	watchWorktree                  // a hot working-tree directory: plain edits, rate-limited
+)
 
 // daemonState is the whole daemon's in-memory state: one shared inotify
 // instance and a map of actively-watched repos.
@@ -287,21 +411,34 @@ var gitDirFiles = map[string]bool{
 }
 
 func (w *watch) relevant(name string) bool {
+	if w.kind == watchWorktree {
+		return !isEditorNoise(name)
+	}
 	if strings.HasSuffix(name, ".lock") {
 		return false // the rename to the final name is what counts
 	}
-	return w.isRefs || gitDirFiles[name]
+	return w.kind == watchRefs || gitDirFiles[name]
+}
+
+// isEditorNoise reports names editors write next to the file being
+// edited, often every few seconds (vim swap files and its "4913" write
+// test, backup files, emacs lock files), plus the repo's own .git entry.
+func isEditorNoise(name string) bool {
+	return name == ".git" || name == "4913" ||
+		strings.HasSuffix(name, ".swp") || strings.HasSuffix(name, ".swo") ||
+		strings.HasSuffix(name, ".swx") || strings.HasSuffix(name, "~") ||
+		strings.HasPrefix(name, ".#")
 }
 
 // addWatch must be called with d.mu held.
-func (d *daemonState) addWatch(root, path string, isRefs bool) (int, bool) {
+func (d *daemonState) addWatch(root, path string, kind watchKind) (int, bool) {
 	wd, err := syscall.InotifyAddWatch(d.inotifyFd, path, inotifyMask)
 	if err != nil {
 		return 0, false
 	}
 	w := d.watches[wd]
 	if w == nil {
-		w = &watch{path: path, isRefs: isRefs, roots: make(map[string]bool)}
+		w = &watch{path: path, kind: kind, roots: make(map[string]bool)}
 		d.watches[wd] = w
 	}
 	w.roots[root] = true
@@ -317,7 +454,7 @@ func (d *daemonState) addRefsWatches(root, dir string) []int {
 		if err != nil || !e.IsDir() {
 			return nil
 		}
-		if wd, ok := d.addWatch(root, path, true); ok {
+		if wd, ok := d.addWatch(root, path, watchRefs); ok {
 			wds = append(wds, wd)
 		}
 		return nil
@@ -331,11 +468,11 @@ func (d *daemonState) addRefsWatches(root, dir string) []int {
 func (d *daemonState) addWatches(root string) []int {
 	gitDir, commonDir := gitDirs(root)
 	var wds []int
-	if wd, ok := d.addWatch(root, gitDir, false); ok {
+	if wd, ok := d.addWatch(root, gitDir, watchGitDir); ok {
 		wds = append(wds, wd)
 	}
 	if commonDir != gitDir {
-		if wd, ok := d.addWatch(root, commonDir, false); ok {
+		if wd, ok := d.addWatch(root, commonDir, watchGitDir); ok {
 			wds = append(wds, wd)
 		}
 	}
@@ -357,6 +494,33 @@ func (d *daemonState) removeWatches(root string, wds []int) {
 	}
 }
 
+// setHotWatches replaces root's hot-directory watches with ones for dirs.
+func (d *daemonState) setHotWatches(root string, rs *repoState, dirs []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.repos[root] != rs {
+		return // evicted meanwhile
+	}
+	var wds []int
+	for _, dir := range dirs {
+		if wd, ok := d.addWatch(root, dir, watchWorktree); ok {
+			wds = append(wds, wd)
+		}
+	}
+	rs.mu.Lock()
+	old := rs.hotWatches
+	rs.hotWatches = wds
+	rs.mu.Unlock()
+
+	var gone []int
+	for _, wd := range old {
+		if !slices.Contains(wds, wd) {
+			gone = append(gone, wd)
+		}
+	}
+	d.removeWatches(root, gone)
+}
+
 // getOrCreate returns the cached state for root, setting up watches and
 // starting a first fetch in the background the first time this repo is
 // seen. It never blocks on git - callers wait via waitSettled, bounded.
@@ -367,7 +531,7 @@ func (d *daemonState) getOrCreate(root string) *repoState {
 		rs.touch()
 		return rs
 	}
-	rs := &repoState{lastAccess: time.Now()}
+	rs := &repoState{lastAccess: time.Now(), d: d}
 	rs.watches = d.addWatches(root)
 	d.repos[root] = rs
 	d.mu.Unlock()
@@ -425,7 +589,7 @@ func (d *daemonState) housekeep(listener net.Listener) {
 			rs.mu.Lock()
 			idle := now.Sub(rs.lastAccess) > d.idleEvict
 			stale := now.Sub(rs.lastRefresh) > d.refreshInterval
-			wds := rs.watches
+			wds := slices.Concat(rs.watches, rs.hotWatches)
 			rs.mu.Unlock()
 
 			if idle {
@@ -497,7 +661,8 @@ func (d *daemonState) drainEvents() {
 // dispatch handles one buffer of raw inotify events. Must be called with
 // d.evMu held.
 func (d *daemonState) dispatch(buf []byte) {
-	touched := make(map[string]bool)
+	touched := make(map[string]bool)   // .git changes: refresh right away
+	wtTouched := make(map[string]bool) // plain edits: rate-limited
 	for offset := 0; offset+syscall.SizeofInotifyEvent <= len(buf); {
 		raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
 		nameStart := offset + syscall.SizeofInotifyEvent
@@ -521,7 +686,13 @@ func (d *daemonState) dispatch(buf []byte) {
 			if !ok || !w.relevant(name) {
 				break
 			}
-			if w.isRefs && raw.Mask&syscall.IN_ISDIR != 0 && raw.Mask&(syscall.IN_CREATE|syscall.IN_MOVED_TO) != 0 {
+			if w.kind == watchWorktree {
+				for root := range w.roots {
+					wtTouched[root] = true
+				}
+				break
+			}
+			if w.kind == watchRefs && raw.Mask&syscall.IN_ISDIR != 0 && raw.Mask&(syscall.IN_CREATE|syscall.IN_MOVED_TO) != 0 {
 				// A new ref namespace (first push to a remote, first
 				// feature/* branch). Its refs may already have been
 				// written before this watch exists - the refresh
@@ -542,12 +713,16 @@ func (d *daemonState) dispatch(buf []byte) {
 		d.mu.Unlock()
 	}
 
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	for root := range touched {
-		d.mu.Lock()
-		rs := d.repos[root]
-		d.mu.Unlock()
-		if rs != nil {
+		if rs := d.repos[root]; rs != nil {
 			rs.requestRefresh(root)
+		}
+	}
+	for root := range wtTouched {
+		if rs := d.repos[root]; rs != nil && !touched[root] {
+			rs.requestWorktreeRefresh(root)
 		}
 	}
 }

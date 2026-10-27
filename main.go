@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -60,7 +62,18 @@ type gitInfo struct {
 	Ahead     int
 	Behind    int
 	HasUp     bool // has an upstream configured, i.e. ahead/behind are meaningful
+
+	// Daemon-internal (unexported, so never sent over the wire): the
+	// commit HEAD points at, and the directories (relative to the repo
+	// root, in status order) holding changed or untracked files - see
+	// daemon.go's hot directories.
+	commit      string
+	changedDirs []string
 }
+
+// maxHotDirs is how many working-tree directories per repo the daemon
+// watches for plain edits (see daemon.go's updateHotDirs).
+const maxHotDirs = 5
 
 // gitResult is the three-state answer buildPrompt actually needs: not a
 // repo at all (show nothing, same as always), a repo with a successful
@@ -169,8 +182,10 @@ func runGitStatus(dir string) (gitInfo, bool, string) {
 			// ignore (blank line, or other header lines like branch.upstream)
 		case strings.HasPrefix(line, "? "):
 			gi.Untracked = true // untracked file
+			gi.addChangedDir(line[2:])
 		case strings.HasPrefix(line, "u "):
 			gi.Unstaged = true // unmerged/conflict - surfaced as dirty for now
+			gi.addChangedDir(statusPath(line, 10))
 		case strings.HasPrefix(line, "1 ") || strings.HasPrefix(line, "2 "):
 			fields := strings.Fields(line)
 			if len(fields) >= 2 && len(fields[1]) == 2 {
@@ -182,14 +197,46 @@ func runGitStatus(dir string) (gitInfo, bool, string) {
 					gi.Unstaged = true
 				}
 			}
+			if line[0] == '1' {
+				gi.addChangedDir(statusPath(line, 8))
+			} else {
+				// "2" (rename/copy): "<path>\t<origPath>"
+				p, _, _ := strings.Cut(statusPath(line, 9), "\t")
+				gi.addChangedDir(p)
+			}
 		}
 	}
 
+	gi.commit = oid
 	gi.Detached = gi.Branch == "(detached)"
 	if gi.Detached && len(oid) >= 7 {
 		gi.Branch = oid[:7]
 	}
 	return gi, true, ""
+}
+
+// statusPath returns the path of a porcelain v2 entry line: whatever
+// follows its first n space-separated fields (paths may contain spaces).
+func statusPath(line string, n int) string {
+	parts := strings.SplitN(line, " ", n+1)
+	if len(parts) <= n {
+		return ""
+	}
+	return parts[n]
+}
+
+// addChangedDir records the directory of a changed/untracked path, up to
+// maxHotDirs distinct ones - more are never watched anyway.
+func (gi *gitInfo) addChangedDir(path string) {
+	if path == "" || len(gi.changedDirs) >= maxHotDirs {
+		return
+	}
+	// An untracked directory is reported as "dir/" - the new entry
+	// appeared in its parent.
+	dir := filepath.Dir(strings.TrimSuffix(path, "/"))
+	if !slices.Contains(gi.changedDirs, dir) {
+		gi.changedDirs = append(gi.changedDirs, dir)
+	}
 }
 
 func displayPath(home, cwd string) string {
