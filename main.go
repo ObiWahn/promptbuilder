@@ -69,10 +69,11 @@ type gitInfo struct {
 // silently looking identical to "not a repo"). Fields are exported for the
 // same JSON round-trip reason as gitInfo.
 type gitResult struct {
-	IsRepo bool
-	OK     bool
-	Info   gitInfo
-	Error  string
+	IsRepo  bool
+	OK      bool
+	Pending bool // status not known yet; Info holds only the branch from HEAD
+	Info    gitInfo
+	Error   string
 }
 
 // defaultGitTimeout is generous on purpose: it costs nothing for a normal
@@ -80,7 +81,7 @@ type gitResult struct {
 // Linux kernel tree - hundreds of thousands of files - a single `git
 // status` can legitimately take several seconds even with nothing wrong.
 // Killing it prematurely wouldn't just lose that one call: since a timeout
-// self-heals by retrying (see refresh/getOrCreate in daemon.go), a repo
+// self-heals by retrying (see fetchLoop/housekeep in daemon.go), a repo
 // that's genuinely always slower than the timeout would retry forever
 // without ever actually finishing. Overridable per environment since
 // "generous enough" depends on repo size and disk speed.
@@ -126,7 +127,10 @@ func runGitStatus(dir string) (gitInfo, bool, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain=v2", "--branch")
+	// --no-optional-locks: plain `git status` opportunistically rewrites
+	// .git/index (taking index.lock), which contends with the user's own git
+	// commands and makes the daemon's inotify watch fire on itself.
+	cmd := exec.CommandContext(ctx, "git", "--no-optional-locks", "status", "--porcelain=v2", "--branch")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -244,7 +248,7 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 	}
 	if gr := fetchGit(); !gr.IsRepo {
 		// not a repo - show nothing, same as always
-	} else if !gr.OK {
+	} else if !gr.OK && !gr.Pending {
 		// A repo, but every fetch attempt so far has failed - surface it
 		// instead of silently looking identical to "not a repo", which is
 		// exactly what made the underlying bug confusing to notice.
@@ -266,7 +270,9 @@ func buildPrompt(exitCode int, useDaemon bool) string {
 		// The original inserts exactly one space before the flags block as a
 		// whole (only if there's anything to show), never between the
 		// individual flags themselves - i.e. "master *>", not "master * >".
-		if gi.Staged || gi.Unstaged || gi.Untracked || gi.HasUp {
+		if gr.Pending {
+			sb.WriteString(" \xe2\x80\xa6") // "…": flags not known yet (Info has none set)
+		} else if gi.Staged || gi.Unstaged || gi.Untracked || gi.HasUp {
 			sb.WriteString(" ")
 		}
 		if gi.Staged {

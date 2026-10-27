@@ -103,15 +103,33 @@ can toggle back and forth as many times as you like in that shell.
 `promptbuilder --daemon` is a hidden mode, spawned automatically and never
 run directly. The normal CLI is the client: it tries to connect to the
 daemon's Unix socket first, and only falls back to running `git status`
-itself if the daemon is unreachable for any reason - the daemon is a pure
-optimization, never a hard dependency.
+itself if no daemon accepts the connection - the daemon is a pure
+optimization, never a hard dependency. A daemon that accepts but doesn't
+answer within 500ms gets the branch-only `…` form described below rather
+than a direct `git status`, which would most likely be just as slow.
 
 - Resolves each repo's root itself (pure Go directory walk for `.git`, no
   git subprocess) and caches status per root.
-- Refreshes instantly via `inotify` on `.git/HEAD`, `.git/index`, and
-  `.git/refs/*` (commits, checkouts, staging), plus a periodic tick
-  (`PROMPTBUILDER_REFRESH_INTERVAL`, default `30s`) as a fallback for
-  plain unstaged edits that never touch `.git/`.
+- Refreshes instantly via `inotify` on the git dir (`HEAD`, `index`,
+  `packed-refs`, `config`) and every directory under `refs/` (local
+  branches including `feature/x`-style names, `refs/remotes/*` so
+  push/fetch update ahead/behind, tags). Directories are watched rather
+  than the files themselves, since git replaces those files by renaming
+  `X.lock` over them. Linked worktrees (`.git` as a file) are followed to
+  their git dir and common dir. A periodic tick
+  (`PROMPTBUILDER_REFRESH_INTERVAL`, default `30s`) remains as the fallback
+  for plain unstaged edits that never touch `.git/`.
+- A change that lands while a refresh is already running is never
+  dropped: the running `git status` is simply repeated once it finishes.
+- Each request first processes any inotify events already queued (the
+  command that just finished produced them), then waits up to
+  `PROMPTBUILDER_WAIT_BUDGET` (default `300ms`) for a running refresh, so
+  the prompt shows the result of the command that just ran rather than
+  the one before. If git is slower than that, the previous state is
+  shown; for a repo seen for the first time, the branch is read straight
+  from `HEAD` and the flags show as `…` until the first status is in.
+- The daemon runs `git --no-optional-locks status`, so it never rewrites
+  `.git/index` or competes with your own git commands for `index.lock`.
 - Evicts a repo's cache and watches after `PROMPTBUILDER_IDLE_EVICT`
   (default `15m`) of no requests, and exits itself once nothing is left
   to track - a new daemon spawns on demand the next time one's needed.
@@ -165,6 +183,7 @@ Read once at daemon startup, no live reload:
 PROMPTBUILDER_REFRESH_INTERVAL=30s   # periodic fallback refresh
 PROMPTBUILDER_IDLE_EVICT=15m         # per-repo cache/watch eviction
 PROMPTBUILDER_GIT_TIMEOUT=5s         # per-call timeout before retrying
+PROMPTBUILDER_WAIT_BUDGET=300ms      # max wait per request for a running refresh
 ```
 
 ## Files

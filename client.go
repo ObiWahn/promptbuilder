@@ -17,25 +17,23 @@ const (
 	daemonDialTimeout = 150 * time.Millisecond
 
 	// daemonResponseTimeout: how long to wait for an actual response once
-	// connected. Needs headroom above runGitStatus's own 1s timeout (see
-	// main.go), since the first request for a newly-seen repo blocks on a
-	// synchronous fetch (daemon.go's getOrCreate) - using the short dial
-	// timeout here too would make every cold-repo request spuriously time
-	// out client-side before the daemon's own fetch even finishes.
-	daemonResponseTimeout = 2 * time.Second
+	// connected. The daemon itself answers within its wait budget
+	// (daemon.go's defaultWaitBudget) no matter how slow git is, so this
+	// only needs a little headroom above that.
+	daemonResponseTimeout = 500 * time.Millisecond
 )
 
 // resolveGit is what the live-PS1 render path calls for git status. It
 // tries the caching daemon first and only falls back to a direct
-// `git status` call (today's behavior, unchanged) if the daemon isn't
-// reachable - the daemon is a pure optimization, never a hard dependency.
+// `git status` call if the daemon isn't reachable at all - the daemon is a
+// pure optimization, never a hard dependency.
 func resolveGit() gitResult {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return directGitResult("")
 	}
 
-	if gr, usable := tryDaemon(cwd); usable {
+	if gr, reached := tryDaemon(cwd); reached {
 		return gr
 	}
 
@@ -43,10 +41,13 @@ func resolveGit() gitResult {
 	return directGitResult(cwd)
 }
 
-// tryDaemon asks the daemon for cached git status. usable reports whether
-// the daemon actually answered at all - the caller must fall back to a
-// direct git call whenever usable is false, regardless of gr's contents.
-func tryDaemon(cwd string) (gr gitResult, usable bool) {
+// tryDaemon asks the daemon for cached git status. reached reports whether
+// a daemon was there to connect to at all - the caller must fall back to a
+// direct git call whenever reached is false, regardless of gr's contents.
+// If a daemon was reached but didn't answer in time, running git directly
+// would most likely be just as slow, so gr is instead a pending result
+// with only the branch, read straight from HEAD.
+func tryDaemon(cwd string) (gr gitResult, reached bool) {
 	conn, err := net.DialTimeout("unix", socketPath(), daemonDialTimeout)
 	if err != nil {
 		return gitResult{}, false
@@ -55,14 +56,22 @@ func tryDaemon(cwd string) (gr gitResult, usable bool) {
 	conn.SetDeadline(time.Now().Add(daemonResponseTimeout))
 
 	if _, err := conn.Write([]byte(cwd + "\n")); err != nil {
-		return gitResult{}, false
+		return pendingGitResult(cwd), true
 	}
 
 	var resp daemonResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
-		return gitResult{}, false
+		return pendingGitResult(cwd), true
 	}
-	return gitResult{IsRepo: resp.IsRepo, OK: resp.OK, Info: resp.Info, Error: resp.Error}, true
+	return gitResult{IsRepo: resp.IsRepo, OK: resp.OK, Pending: resp.Pending, Info: resp.Info, Error: resp.Error}, true
+}
+
+func pendingGitResult(cwd string) gitResult {
+	root, isRepo := findRepoRoot(cwd)
+	if !isRepo {
+		return gitResult{}
+	}
+	return gitResult{IsRepo: true, Pending: true, Info: headInfo(root)}
 }
 
 // spawnDaemon starts `promptbuilder --daemon` fully detached and returns
